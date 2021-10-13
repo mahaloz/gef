@@ -7469,6 +7469,197 @@ class SolveKernelSymbolCommand(GenericCommand):
             err("No match for '{:s}'".format(sym))
         return
 
+@register_command
+class AddSymbolCommand(GenericCommand):
+    """
+    Adds a single built-in symbol into GDB. The symbol can only be an object or function type.
+    Size and type are optional, but recommended for adding functions of known size.
+    """
+
+    _cmdline_ = "add-symbol"
+    _syntax_  = "{:s} symbol_name base_addr [sym_type size]".format(_cmdline_)
+    _example_ = "{:s} main 0x210 function 0x40".format(_cmdline_)
+
+    def do_invoke(self, argv):
+        if len(argv) < 2:
+            err("Incorrect argument amount!")
+            return
+
+        # set default args
+        sym_name = argv[0]
+        base_addr = int(argv[1], 0)
+        sym_type = "function"
+        size = 0
+
+        if len(argv) >= 3:
+            sym_type = argv[2]
+            size = int(argv[3], 0)
+
+        sym_info = sym_name, base_addr, sym_type, size
+        AddSymbolCommand.add_symbols([sym_info])
+
+
+    @classmethod
+    def add_symbols(cls, sym_info_list):
+        """
+        Adds a list of symbols to gdb's internal symbol listing. Only function and global symbols are supported.
+        Symbol info looks like:
+        (symbol_name: str, base_addr: int, sym_type: str, size: int)
+        If you don't know the size, pass 0.
+
+        Explanation of how this works:
+        Adding symbols to GDB is non-trivial, it requires the use of an entire object file. Because of its
+        difficulty, this is currently only supported on ELFs. When adding a symbole, we use two binutils,
+        gcc and objcopy. After making a small ELF, we strip it of everything but needed sections. We then
+        use objcopy to one-by-one add a symbol the file. Objcopy does not support sizing, so we do a byte
+        patch on the binary to allow for a real size. Finally, the whole object is read in with the default
+        gdb command: add-symbol-file.
+        """
+        # validate binutils bins exist
+        try:
+            gcc = which("gcc")
+            objcopy = which("objcopy")
+        except FileNotFoundError as e:
+            err("Binutils binaries not found: {}".format(e))
+            return
+
+        elf_cache = {}
+
+        #
+        # Private symbol-file constructors
+        #
+
+        def _construct_small_elf():
+            if elf_cache:
+                open(elf_cache["fname"], "wb").write(elf_cache["data"])
+                return elf_cache["fname"]
+
+            # compile a small elf for symbol loading
+            fd, fname = tempfile.mkstemp(dir="/tmp", suffix=".c")
+            os.fdopen(fd, "w").write("int main() {}")
+            os.system(f"{gcc} {fname} -no-pie -o {fname}.debug")
+            # destroy the source file
+            os.unlink(f"{fname}")
+
+            # delete unneeded sections from object file
+            os.system(f"{objcopy} --only-keep-debug {fname}.debug")
+            os.system(f"{objcopy} --strip-all {fname}.debug")
+            elf = get_elf_headers(f"{fname}.debug")
+
+            required_sections = [".text", ".interp", ".rela.dyn", ".dynamic"]
+            for s in elf.shdrs:
+                # keep some required sections
+                if s.sh_name in required_sections:
+                    continue
+
+                os.system(f"{objcopy} --remove-section={s.sh_name} {fname}.debug 2>/dev/null")
+
+            # cache the small object file for use
+            elf_cache["fname"] = fname + ".debug"
+            elf_cache["data"] = open(elf_cache["fname"], "rb").read()
+            return elf_cache["fname"]
+
+        def _force_update_sym_sizes(fname, queued_sym_sizes):
+            # parsing based on: https://github.com/torvalds/linux/blob/master/include/uapi/linux/elf.h
+            get_elf_headers.cache_clear()
+            elf: Elf = get_elf_headers(fname)
+            elf_data = bytearray(open(fname, "rb").read())
+
+            # find the symbol table
+            for section in elf.shdrs:
+                if section.sh_name == ".symtab":
+                    break
+            else:
+                return
+
+            # locate the location of the symbols size in the symtab
+            tab_offset = section.sh_offset
+            sym_data_size = 24 if elf.ELF_64_BITS else 16
+            sym_size_off = sym_data_size - 8
+
+            for i, size in queued_sym_sizes.items():
+                # skip sizes of 0
+                if not size:
+                    continue
+
+                # compute offset
+                sym_size_loc = tab_offset + sym_data_size*(i + 5) + sym_size_off
+                pack_str = "<Q" if elf.ELF_64_BITS else "<I"
+                # write the new size
+                updated_size = struct.pack(pack_str, size)
+                elf_data[sym_size_loc:sym_size_loc+len(updated_size)] = updated_size
+
+            # write data back to elf
+            open(fname, "wb").write(elf_data)
+
+        def _add_symbol_file(fname, cmd_string_arr, text_base, queued_sym_sizes):
+            # add the symbols through copying
+            cmd_string = ' '.join(cmd_string_arr)
+            os.system(f"{objcopy} {cmd_string} {fname}")
+
+            # force update the size of each symbol
+            _force_update_sym_sizes(fname, queued_sym_sizes)
+
+            gdb.execute(f"add-symbol-file {fname} {text_base:#x}", to_string=True)
+            #os.unlink(fname)
+            return
+
+        #
+        # Processing code
+        #
+
+        info("{:d} symbols will be added".format(len(sym_info_list)))
+
+        # locate the base address of the binary
+        vmmap = get_process_maps()
+        text_base = min([x.page_start for x in vmmap if x.path == get_filepath()])
+        info(f"text: {hex(text_base)}")
+
+        # add each symbol into a mass symbol commit
+        max_commit_size = 1000
+        supported_types = ["function", "object"]
+
+        objcopy_cmds = []
+        queued_sym_sizes = {}
+        fname = _construct_small_elf()
+        for i, (name, addr, typ, size) in enumerate(sym_info_list):
+            if typ not in supported_types:
+                warn("Skipping symbol {}, type is not supported: {}".format(name, typ))
+                continue
+
+            # queue the sym for later use
+            queued_sym_sizes[i] = size
+
+            # absolute addressing
+            if addr >= text_base:
+                addr_str = "{:#x}".format(addr)
+            # relative addressing
+            else:
+                addr_str = ".text:{:#x}".format(addr)
+
+            # create a symbol command for the symbol
+            objcopy_cmds.append(
+                "--add-symbol '{name}'={addr_str},global,{type_flag}".format(
+                    name=name, addr_str=addr_str, type_flag=typ
+                )
+            )
+
+            info(f"commands: {objcopy_cmds}")
+            # batch commit
+            if i > 1 and not i % max_commit_size:
+                # add the queued symbols
+                _add_symbol_file(fname, objcopy_cmds, text_base, queued_sym_sizes)
+
+                # re-init queues and elf
+                fname = _construct_small_elf(text_base)
+                objcopy_cmds = []
+                queued_sym_sizes = {}
+
+        # commit remaining symbol commands
+        if objcopy_cmds:
+            _add_symbol_file(fname, objcopy_cmds, text_base, queued_sym_sizes)
+
+        info("{:d} symbols were added".format(i + 1))
 
 @register_command
 class DetailRegistersCommand(GenericCommand):
