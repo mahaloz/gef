@@ -7509,9 +7509,9 @@ class AddSymbolCommand(GenericCommand):
 
         Explanation of how this works:
         Adding symbols to GDB is non-trivial, it requires the use of an entire object file. Because of its
-        difficulty, this is currently only supported on ELFs. When adding a symbole, we use two binutils,
+        difficulty, this is currently only supported on ELFs. When adding a symbol, we use two binutils,
         gcc and objcopy. After making a small ELF, we strip it of everything but needed sections. We then
-        use objcopy to one-by-one add a symbol the file. Objcopy does not support sizing, so we do a byte
+        use objcopy to one-by-one add a symbol to the file. Objcopy does not support sizing, so we do a byte
         patch on the binary to allow for a real size. Finally, the whole object is read in with the default
         gdb command: add-symbol-file.
         """
